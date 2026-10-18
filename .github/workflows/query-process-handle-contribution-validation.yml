@@ -1,0 +1,105 @@
+name: Validate retained query handle contribution
+
+# This workflow belongs only to the contributor's validation branch, not the
+# upstream feature PR. It executes five fixed inert/query-only SDK unit tests.
+on:
+  push:
+    branches: [codex/validate-query-process-handle]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+concurrency:
+  group: query-handle-contribution-validation
+  cancel-in-progress: false
+
+jobs:
+  windows-sdk-query-tests:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Install fixed Rust toolchain on this disposable runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+      - name: Compile SDK and run only the selected query and forwarding tests
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Path ../query-handle-evidence | Out-Null
+          rustc +1.95.0 -Vv > ../query-handle-evidence/rustc.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain query failed' }
+          $taskQueryFilters = @(
+            'native_query_process',
+            'process_wrappers_forward_stream_lifecycle_operations',
+            'dacl_guarded_process_delegates_to_inner'
+          )
+          $taskExpectedNames = @{
+            native_query_process = @(
+              'core_modules::mxc_common::sandbox_process::runner_tests::native_query_process_handle_defaults_to_unsupported_without_os_calls',
+              'sandbox::tests::native_query_process_handle_is_independent_of_stdio_transfer',
+              'backend_modules::process_container::common::base_container_runner::tests::native_query_process_duplicate_is_noninheritable_and_independently_owned'
+            )
+            process_wrappers_forward_stream_lifecycle_operations = @(
+              'core_modules::mxc_engine::telemetry_process_tests::process_wrappers_forward_stream_lifecycle_operations'
+            )
+            dacl_guarded_process_delegates_to_inner = @(
+              'backend_modules::process_container::common::dispatcher::tests::dacl_guarded_process_delegates_to_inner'
+            )
+          }
+          $taskVerifiedNames = @()
+          foreach ($taskQueryFilter in $taskQueryFilters) {
+            cargo +1.95.0 test --locked -p mxc-sdk --lib $taskQueryFilter -- --test-threads=1 2>&1 |
+              Tee-Object -FilePath "../query-handle-evidence/$taskQueryFilter.log"
+            if ($LASTEXITCODE -ne 0) { throw 'Selected SDK compilation or tests failed' }
+            $taskLog = Get-Content -LiteralPath "../query-handle-evidence/$taskQueryFilter.log" -Raw
+            $taskObserved = @([regex]::Matches($taskLog, '(?m)^test ([A-Za-z0-9_:]+) \.\.\. ok\r?$') |
+              ForEach-Object { $_.Groups[1].Value })
+            $taskExpected = $taskExpectedNames[$taskQueryFilter]
+            if ($taskObserved.Count -ne $taskExpected.Count -or
+                (Compare-Object ($taskObserved | Sort-Object) ($taskExpected | Sort-Object))) {
+              throw 'Selected SDK test names, count or passing results differ'
+            }
+            $taskVerifiedNames += $taskObserved
+          }
+          $taskChanged = git status --porcelain --untracked-files=no
+          if ($taskChanged) { throw 'Build changed tracked source or lock files' }
+          $taskSources = @(
+            'mxc-sdk/src/sandbox.rs',
+            'mxc-sdk/src/core/mxc_common/sandbox_process.rs',
+            'mxc-sdk/src/core/mxc_engine/mod.rs',
+            'mxc-sdk/src/backends/process_container/common/base_container_runner.rs',
+            'mxc-sdk/src/backends/process_container/common/dispatcher.rs',
+            'Cargo.lock'
+          )
+          $taskHashes = foreach ($taskSource in $taskSources) {
+            [pscustomobject]@{
+              path = $taskSource
+              sha256 = (Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          [pscustomobject]@{
+            source_commit = (git rev-parse HEAD)
+            selected_filters = $taskQueryFilters
+            exact_passing_test_names = $taskVerifiedNames
+            sandbox_or_child_execution_requested = $false
+            source_files = $taskHashes
+          } | ConvertTo-Json -Depth 5 | Set-Content ../query-handle-evidence/PROVENANCE.json
+      - name: Retain compiler and selected test records
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: query-handle-validation-${{ github.sha }}
+          path: query-handle-evidence/
+          if-no-files-found: warn
+          retention-days: 7
